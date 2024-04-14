@@ -99,6 +99,41 @@ app.single_config_mode = False
 app.single_config_id = None
 
 
+class RequestBodyDeepchat(BaseModel):
+    config_id: Optional[str] = Field(
+        default=None, description="The id of the configuration to be used."
+    )
+    config_ids: Optional[List[str]] = Field(
+        default=None,
+        description="The list of configuration ids to be used. "
+        "If set, the configurations will be combined.",
+    )
+    thread_id: Optional[str] = Field(
+        default=None,
+        description="The id of an existing thread to which the messages should be added.",
+    )
+    messages: List[dict] = Field(
+        default=None, description="The list of messages in the current conversation."
+    )
+    context: Optional[dict] = Field(
+        default=None,
+        description="Additional context data to be added to the conversation.",
+    )
+    stream: Optional[bool] = Field(
+        default=False,
+        description="If set, partial message deltas will be sent, like in ChatGPT. "
+        "Tokens will be sent as data-only server-sent events as they become "
+        "available, with the stream terminated by a data: [DONE] message.",
+    )
+    options: Optional[GenerationOptions] = Field(
+        default=None, description="Additional options for controlling the generation."
+    )
+    state: Optional[dict] = Field(
+        default=None,
+        description="A state object that should be used to continue the interaction.",
+    )
+
+
 class RequestBody(BaseModel):
     config_id: Optional[str] = Field(
         default=None, description="The id of the configuration to be used."
@@ -132,6 +167,10 @@ class RequestBody(BaseModel):
         default=None,
         description="A state object that should be used to continue the interaction.",
     )
+
+
+class ResponseBodyDeepchat(BaseModel):
+    text: str = Field(default=None, description="Response text")
 
 
 class ResponseBody(BaseModel):
@@ -238,6 +277,143 @@ def _get_rails(config_ids: List[str]) -> LLMRails:
 
 
 @app.post(
+    "/deepchat",
+    response_model=ResponseBodyDeepchat,
+    response_model_exclude_none=True,
+)
+async def deepchat(body: RequestBodyDeepchat, request: Request):
+    """Deepchat connect API"""
+    # Text messages are stored inside request body using the Deep Chat JSON format:
+    # https://deepchat.dev/docs/connect
+    # {"messages":[{"role":"user","text":"hi"}],"field":"value"}
+    print(f"body: {body}")
+
+    if not body.config_ids:
+        if body.config_id:
+            body.config_ids = [body.config_id]
+        else:
+            body.config_ids = ["config"]
+    log.info("Got request for config %s", body.config_id)
+
+    # Save the request headers in a context variable.
+    api_request_headers.set(request.headers)
+
+    config_ids = body.config_ids
+    try:
+        llm_rails = _get_rails(config_ids)
+    except ValueError as ex:
+        log.exception(ex)
+        return {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": f"Could not load the {config_ids} guardrails configuration. "
+                    f"An internal error has occurred.",
+                }
+            ]
+        }
+
+    try:
+        messages = body.messages
+        if body.context:
+            messages.insert(0, {"role": "context", "content": body.context})
+
+        # If we have a `thread_id` specified, we need to look up the thread
+        datastore_key = None
+
+        if body.thread_id:
+            if datastore is None:
+                raise RuntimeError("No DataStore has been configured.")
+
+            # We make sure the `thread_id` meets the minimum complexity requirement.
+            if len(body.thread_id) < 16:
+                return {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": "The `thread_id` must have a minimum length of 16 characters.",
+                        }
+                    ]
+                }
+
+            # Fetch the existing thread messages. For easier management, we prepend
+            # the string `thread-` to all thread keys.
+            datastore_key = "thread-" + body.thread_id
+            thread_messages = json.loads(await datastore.get(datastore_key) or "[]")
+
+            # And prepend them.
+            messages = thread_messages + messages
+
+        if (
+            body.stream
+            and llm_rails.config.streaming_supported
+            and llm_rails.main_llm_supports_streaming
+        ):
+            # Create the streaming handler instance
+            streaming_handler = StreamingHandler()
+
+            # Start the generation
+            asyncio.create_task(
+                llm_rails.generate_async(
+                    messages=messages,
+                    streaming_handler=streaming_handler,
+                    options=body.options,
+                    state=body.state,
+                )
+            )
+
+            # TODO: Add support for thread_ids in streaming mode
+
+            return StreamingResponse(streaming_handler)
+        else:
+            # {"messages":[{"role":"user","text":"hi"}]}
+            # replace 'text' key in messages with 'content'
+            messages = [{"role": m["role"], "content": m["text"]} for m in messages]
+            res = await llm_rails.generate_async(
+                messages=messages, options=body.options, state=body.state
+            )
+
+            if isinstance(res, GenerationResponse):
+                bot_message = res.response[0]
+            else:
+                assert isinstance(res, dict)
+                bot_message = res
+
+            # If we're using threads, we also need to update the data before returning
+            # the message.
+            if body.thread_id:
+                await datastore.set(datastore_key, json.dumps(messages + [bot_message]))
+
+            result = {"messages": [bot_message]}
+            # result = {"text": bot_message}
+
+            # If we have additional GenerationResponse fields, we return as well
+            if isinstance(res, GenerationResponse):
+                result["llm_output"] = res.llm_output
+                result["output_data"] = res.output_data
+                result["log"] = res.log
+                result["state"] = res.state
+
+            # fastapi.exceptions.ResponseValidationError: 1 validation errors:
+            # {'type': 'string_type', 'loc': ('response', 'text'), 'msg': 'Input should be a valid string', 'input': {'role': 'assistant', 'content': 'Hello! How can I assist you today?'}, 'url': 'https://errors.pydantic.dev/2.7/v/string_type'}
+
+            # {'messages': [{'role': 'assistant', 'content': 'Hello! How can I assist you today?'}]}
+            # Replace 'content' key in messages with 'text'
+            result = {"text": result["messages"][0]["content"]}
+            print(f"result: {result}")
+            return result
+            # return {"text": "This is a respone from a Flask server. Thankyou for your message!"}
+
+    except Exception as ex:
+        log.exception(ex)
+        return {"text": "Internal server error."}
+
+    # Sends response back to Deep Chat using the Response format:
+    # https://deepchat.dev/docs/connect/#Response
+    return {"text": "This is a respone from a Flask server. Thankyou for your message!"}
+
+
+@app.post(
     "/v1/chat/completions",
     response_model=ResponseBody,
     response_model_exclude_none=True,
@@ -278,6 +454,9 @@ async def chat_completion(body: RequestBody, request: Request):
 
     try:
         messages = body.messages
+        # If messages contain an object with a `role` key set to `system, remove that object.
+        messages = [m for m in messages if m.get("role") != "system"]
+        print(f"cleaned messages: {messages}")
         if body.context:
             messages.insert(0, {"role": "context", "content": body.context})
 
