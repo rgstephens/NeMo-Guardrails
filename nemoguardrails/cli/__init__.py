@@ -59,6 +59,10 @@ def chat(
         default=[],
         help="Enable debug mode which prints rich information about the flows execution. Available levels: WARNING, INFO, DEBUG",
     ),
+    debug_logfile: str = typer.Option(
+        default=[],
+        help="Log debug information to a file.",
+    ),
     streaming: bool = typer.Option(
         default=False,
         help="If the chat should use the streaming mode, if possible.",
@@ -90,6 +94,7 @@ def chat(
             debug=len(debug_level) > 0,
             debug_level=debug_level[0] if debug_level else "INFO",
             simplify=verbose_simplify,
+            debug_logfile=debug_logfile,
         )
 
     run_chat(

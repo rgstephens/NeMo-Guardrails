@@ -23,6 +23,8 @@ from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
+import structlog
+
 from nemoguardrails.colang.v2_x.lang.colang_ast import (
     Abort,
     Assignment,
@@ -74,6 +76,7 @@ from nemoguardrails.colang.v2_x.runtime.utils import new_readable_uid
 from nemoguardrails.utils import console, new_event_dict, new_uid
 
 log = logging.getLogger(__name__)
+structlog_logger = structlog.get_logger("structlog_logger")
 
 random_seed = int(time.time())
 
@@ -285,6 +288,12 @@ def run_to_completion(state: State, external_event: Union[dict, Event]) -> State
             while state.internal_events:
                 event = state.internal_events.popleft()
                 log.info("Process internal event: %s", event)
+                event_dict = event.to_dict()
+                structlog_logger.info(
+                    message="Process internal event",
+                    name=event_dict["name"],
+                    **event_dict.get("arguments", {}),
+                )
 
                 # Find all active interaction loops
                 active_interaction_loops = set()
@@ -1697,11 +1706,23 @@ def _generate_umim_event(state: State, event: Event) -> Dict[str, Any]:
 
 def _push_internal_event(state: State, event: Event) -> None:
     state.internal_events.append(event)
+    event_dict = event.to_dict()
+    structlog_logger.info(
+        message="Created internal event",
+        name=event_dict["name"],
+        **event_dict.get("arguments", {}),
+    )
     log.debug("Created internal event: %s", event)
 
 
 def _push_left_internal_event(state: State, event: InternalEvent) -> None:
     state.internal_events.appendleft(event)
+    event_dict = event.to_dict()
+    structlog_logger.info(
+        message="Created internal event",
+        name=event_dict["name"],
+        **event_dict.get("arguments", {}),
+    )
     log.debug("Created internal event: %s", event)
 
 

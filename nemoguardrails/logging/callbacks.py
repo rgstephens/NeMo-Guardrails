@@ -18,6 +18,7 @@ from time import time
 from typing import Any, Dict, List, Optional, Union
 from uuid import UUID
 
+import structlog
 from langchain.callbacks import StdOutCallbackHandler
 from langchain.callbacks.base import AsyncCallbackHandler, BaseCallbackManager
 from langchain.callbacks.manager import AsyncCallbackManagerForChainRun
@@ -29,6 +30,7 @@ from nemoguardrails.logging.processing_log import processing_log_var
 from nemoguardrails.logging.stats import LLMStats
 
 log = logging.getLogger(__name__)
+structlog_logger = structlog.get_logger("structlog_logger")
 
 
 class LoggingCallbackHandler(AsyncCallbackHandler, StdOutCallbackHandler):
@@ -57,6 +59,10 @@ class LoggingCallbackHandler(AsyncCallbackHandler, StdOutCallbackHandler):
             explain_info.llm_calls.append(llm_call_info)
 
         log.info("Invocation Params :: %s", kwargs.get("invocation_params", {}))
+        structlog_logger.info(
+            message="LLM Invocation", **kwargs.get("invocation_params", {})
+        )
+        structlog_logger.info(message="LLM Prompt", prompt=prompts[0])
         log.info("Prompt :: %s", prompts[0])
         llm_call_info.prompt = prompts[0]
 
@@ -145,6 +151,15 @@ class LoggingCallbackHandler(AsyncCallbackHandler, StdOutCallbackHandler):
     ) -> None:
         """Run when LLM ends running."""
         log.info("Completion :: %s", response.generations[0][0].text)
+        #  user expressed greeting\n\nbot intent: bot express greeting\nbot action: bot say \"Hello there! How can I assist you today?\"
+        # split response.generations[0][0].text into a dict: {"flow_id": "user expressed greeting", "intent": "bot express greeting", "action": "bot say \"Hello there! How can I assist you today?\"}
+        lines = response.generations[0][0].text.strip().split("\n")
+        event = {
+            "flow_id": lines[0],
+            "intent": lines[2].split(": ", 1)[1],
+            "action": lines[3].split(": ", 1)[1],
+        }
+        structlog_logger.info(message="LLM Completion", **event)
         llm_call_info = llm_call_info_var.get()
         if llm_call_info is None:
             llm_call_info = LLMCallInfo()
@@ -161,6 +176,7 @@ class LoggingCallbackHandler(AsyncCallbackHandler, StdOutCallbackHandler):
             for i, generation in enumerate(response.generations[0][1:]):
                 log.info("--- :: Completion %d", i + 2)
                 log.info("Completion :: %s", generation.text)
+                structlog_logger.info(message="LLM Completion", event=generation.text)
 
         log.info("Output Stats :: %s", response.llm_output)
         took = llm_call_info.finished_at - llm_call_info.started_at

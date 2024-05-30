@@ -92,6 +92,13 @@ class Event:
             return self.name == other.name and self.arguments == other.arguments
         return NotImplemented
 
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "arguments": self.arguments,
+            "matching_scores": self.matching_scores,
+        }
+
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Event):
             return self.is_equal(other)
